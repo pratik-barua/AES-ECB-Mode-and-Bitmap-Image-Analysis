@@ -1,0 +1,322 @@
+
+# AES / ECB ENCRYPTED BITMAP INVESTIGATION
+
+from google.colab import files
+from collections import Counter
+from pathlib import Path
+from io import BytesIO
+import struct
+
+import numpy as np
+from PIL import Image
+
+BLOCK = 16
+
+# 1. Upload aes.bmp.enc
+
+print("Please select aes.bmp.enc from your Downloads folder...")
+uploaded = files.upload()
+
+filename = next(iter(uploaded))
+
+print("\nFile selected:", filename)
+
+
+# 2. Load encrypted file
+
+data = Path(filename).read_bytes()
+
+print("\n========== FILE INFORMATION ==========")
+print("File size:", len(data), "bytes")
+
+
+# 3. Split into AES 16-byte blocks
+
+blocks = [
+    data[i:i + BLOCK]
+    for i in range(0, len(data), BLOCK)
+]
+
+# Ignore incomplete final block for AES analysis
+complete_blocks = [
+    block for block in blocks
+    if len(block) == BLOCK
+]
+
+print("AES block size:", BLOCK, "bytes")
+print("Total blocks:", len(blocks))
+print("Complete AES blocks:", len(complete_blocks))
+
+
+# 4. Count repeated AES blocks
+
+counts = Counter(complete_blocks)
+
+print("Unique AES blocks:", len(counts))
+
+most_common_block, most_common_count = counts.most_common(1)[0]
+
+print(
+    "Most common block occurs:",
+    most_common_count,
+    "times"
+)
+
+print("\nTop 10 repeated AES blocks:")
+
+for block, count in counts.most_common(10):
+    print(
+        f"{count:6d} times : {block.hex()}"
+    )
+
+
+# 5. Bitmap parameters
+
+WIDTH = 640
+HEIGHT = 480
+BPP = 24
+HEADER = 54
+
+BYTES_PER_PIXEL = BPP // 8
+EXPECTED_PIXEL_BYTES = WIDTH * HEIGHT * BYTES_PER_PIXEL
+
+print("\n========== BITMAP STRUCTURE ==========")
+print("Width:", WIDTH)
+print("Height:", HEIGHT)
+print("Colour depth:", BPP, "bits")
+print("Bytes per pixel:", BYTES_PER_PIXEL)
+print("Expected pixel data:", EXPECTED_PIXEL_BYTES, "bytes")
+
+# 6. Extract suspected bitmap data
+
+pixel_data = data[
+    HEADER:HEADER + EXPECTED_PIXEL_BYTES
+]
+
+print(
+    "Extracted pixel data:",
+    len(pixel_data),
+    "bytes"
+)
+
+# 7. Raw ciphertext visualisation
+
+pixels = np.frombuffer(
+    pixel_data,
+    dtype=np.uint8
+)
+
+if len(pixels) == EXPECTED_PIXEL_BYTES:
+
+    raw_array = pixels.reshape(
+        HEIGHT,
+        WIDTH,
+        BYTES_PER_PIXEL
+    )
+
+    raw_image = Image.fromarray(
+        raw_array,
+        "RGB"
+    )
+
+else:
+
+    raise ValueError(
+        "The extracted data does not match "
+        "640 x 480 x 3 bytes."
+    )
+
+
+# 8. Create ECB block labels
+
+# Assign the same ID to identical ciphertext blocks
+
+block_order = {
+    block: index
+    for index, (block, count)
+    in enumerate(counts.most_common())
+}
+
+block_ids = np.array(
+    [
+        block_order.get(block, 0)
+        for block in complete_blocks
+    ],
+    dtype=np.uint32
+)
+
+
+# Expand each 16-byte block ID to 16 pixels/bytes
+
+label_bytes = np.repeat(
+    block_ids,
+    BLOCK
+)
+
+
+# We need exactly the bitmap pixel data
+
+label_bytes = label_bytes[:EXPECTED_PIXEL_BYTES]
+
+
+# Remove suspected bitmap header
+
+if len(label_bytes) >= HEADER + EXPECTED_PIXEL_BYTES:
+    label_bytes = label_bytes[
+        HEADER:HEADER + EXPECTED_PIXEL_BYTES
+    ]
+else:
+    # If labels were generated only from pixel data,
+    # use the first expected number of bytes.
+    label_bytes = label_bytes[
+        :EXPECTED_PIXEL_BYTES
+    ]
+
+# 9. Correct ECB block-pattern reconstruction
+
+# Work directly with the 921600-byte image body
+
+image_blocks = [
+    pixel_data[i:i + BLOCK]
+    for i in range(
+        0,
+        len(pixel_data),
+        BLOCK
+    )
+]
+
+image_counts = Counter(image_blocks)
+
+image_order = {
+    block: index
+    for index, (block, count)
+    in enumerate(image_counts.most_common())
+}
+
+image_ids = np.array(
+    [
+        image_order[block]
+        for block in image_blocks
+    ],
+    dtype=np.uint32
+)
+
+
+# One ID per 16-byte AES block
+
+# Create a grayscale representation of block IDs
+
+block_image_values = (
+    image_ids.astype(np.float64)
+)
+
+if block_image_values.max() > 0:
+    block_image_values = (
+        block_image_values
+        / block_image_values.max()
+        * 255
+    )
+
+block_image_values = (
+    block_image_values
+    .astype(np.uint8)
+)
+
+
+# The 640x480 image contains:
+#
+# 640 * 480 * 3 / 16
+# = 57,600 blocks
+#
+# Arrange 40 blocks across and 1,440 rows,
+# then map their positions back to image bytes.
+
+# 10. Create per-pixel ECB pattern
+
+# Repeat each block ID across its 16 bytes
+
+expanded_ids = np.repeat(
+    block_image_values,
+    BLOCK
+)
+
+expanded_ids = expanded_ids[
+    :EXPECTED_PIXEL_BYTES
+]
+
+# Convert the three bytes belonging to each pixel
+# into a single intensity value
+
+pattern_array = expanded_ids.reshape(
+    HEIGHT,
+    WIDTH,
+    3
+)
+
+pattern_gray = pattern_array.max(
+    axis=2
+)
+
+pattern_image = Image.fromarray(
+    pattern_gray,
+    "L"
+)
+
+# 11. Create binary ECB mask
+
+mask_array = np.where(
+    pattern_gray == 0,
+    0,
+    255
+).astype(np.uint8)
+
+mask_image = Image.fromarray(
+    mask_array,
+    "L"
+)
+
+# 12. Save output files
+
+raw_image.save(
+    "aes_raw.png"
+)
+
+pattern_image.save(
+    "aes_ecb_blocks.png"
+)
+
+mask_image.save(
+    "aes_ecb_mask.png"
+)
+
+
+# 13. Display results
+
+print("\n========== RESULTS ==========")
+
+print("Created:")
+print("1. aes_raw.png")
+print("2. aes_ecb_blocks.png")
+print("3. aes_ecb_mask.png")
+
+
+print("\n========== RAW CIPHERTEXT IMAGE ==========")
+display(raw_image)
+
+
+print("\n========== ECB BLOCK PATTERN ==========")
+display(pattern_image)
+
+
+print("\n========== ECB MASK ==========")
+display(mask_image)
+
+# 14. Download the results
+
+print("\nYou can download the three images from Colab's")
+print("Files panel on the left.")
+
+
+# Optional: download all three automatically
+
+files.download("aes_ecb_blocks.png")
